@@ -66,6 +66,7 @@ public class Servidor extends Thread {
     }
 
     public static void main(String[] args) {
+        //Criar um servidor e iniciá-lo
         Servidor servidor = new Servidor();
         servidor.start();
     }
