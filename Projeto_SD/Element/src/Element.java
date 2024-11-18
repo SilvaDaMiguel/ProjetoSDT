@@ -1,91 +1,117 @@
-import java.net.DatagramPacket;
-import java.net.InetAddress;
-import java.net.MulticastSocket;
+import java.io.IOException;
+import java.net.*;
+import java.nio.file.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
-// Classe que representa um Elemento
-class Elemento {
-    private int id;
-    private long lastHeartbeat;
-    private static final int TIMEOUT = 10000; // Timeout de 10 segundos para verificar o líder
+public class Element {
+    private static final String MULTICAST_GROUP = "224.0.0.1";
+    private static final int MULTICAST_PORT = 4448;
+    private static final int ELEMENT_REQUEST_PORT = 4447;
 
-    public Elemento(int id) {
+    private final int id;
+    private final Path elementDirectory;
+    private final ConcurrentMap<String, String> documents = new ConcurrentHashMap<>();
+
+    public Element(int id) {
         this.id = id;
-        this.lastHeartbeat = System.currentTimeMillis();
+        this.elementDirectory = Paths.get("element_" + id);
+
+        try {
+            if (!Files.exists(elementDirectory)) {
+                Files.createDirectories(elementDirectory);
+                System.out.println("Diretório criado para Elemento " + id + ": " + elementDirectory.toAbsolutePath());
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
 
-    public int getId() {
-        return id;
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.out.println("Uso: java Element <ID>");
+            System.exit(1);
+        }
+
+        int id = Integer.parseInt(args[0]);
+        new Element(id).start();
     }
 
-    public void updateHeartbeat() {
-        this.lastHeartbeat = System.currentTimeMillis();
+    public void start() {
+        System.out.println("Elemento " + id + " iniciado.");
+        new Thread(this::listenToMulticast).start();
+        syncWithLeader();
     }
 
-    public boolean isLeaderActive() {
-        return System.currentTimeMillis() - lastHeartbeat <= TIMEOUT;
+    private void syncWithLeader() {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            InetAddress leaderAddress = InetAddress.getByName("127.0.0.1");
+
+            // Solicita a lista de documentos ao líder
+            String request = "REQUEST_DOCUMENTS";
+            DatagramPacket requestPacket = new DatagramPacket(
+                    request.getBytes(),
+                    request.getBytes().length,
+                    leaderAddress,
+                    ELEMENT_REQUEST_PORT
+            );
+            socket.send(requestPacket);
+
+            // Recebe a lista de documentos
+            byte[] buffer = new byte[1024];
+            while (true) {
+                DatagramPacket responsePacket = new DatagramPacket(buffer, buffer.length);
+                socket.receive(responsePacket);
+
+                String message = new String(responsePacket.getData(), 0, responsePacket.getLength());
+                if (message.equals("END_SYNC")) {
+                    System.out.println("Sincronização com o líder concluída.");
+                    break;
+                }
+
+                String[] parts = message.split(":");
+                String documentId = parts[0];
+                String version = parts[1];
+
+                documents.put(documentId, version);
+                Path filePath = elementDirectory.resolve(documentId + ".txt");
+                Files.writeString(filePath, "Documento: " + documentId + "\nVersão: " + version);
+
+                System.out.println("Elemento " + id + " sincronizou documento: " + documentId);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
-}
 
-// Classe para gerenciar o recebimento de mensagens multicast
-class MulticastReceiver extends Thread {
-    private static final String MULTICAST_GROUP = "224.0.0.1"; // Grupo multicast
-    private static final int MULTICAST_PORT = 4448; // Porta fixa para multicast
-    private Elemento elemento;
-
-    public MulticastReceiver(Elemento elemento) {
-        this.elemento = elemento;
-    }
-
-    @Override
-    public void run() {
+    private void listenToMulticast() {
         try (MulticastSocket multicastSocket = new MulticastSocket(MULTICAST_PORT)) {
             InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
             multicastSocket.joinGroup(group);
 
-            byte[] buffer = new byte[256];
-            System.out.println("Elemento " + elemento.getId() + " conectado ao grupo multicast.");
+            byte[] buffer = new byte[1024];
 
             while (true) {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 multicastSocket.receive(packet);
 
                 String message = new String(packet.getData(), 0, packet.getLength());
-                processMessage(message);
+                System.out.println("Elemento " + id + " recebeu mensagem: " + message);
 
-                if (!elemento.isLeaderActive()) {
-                    System.err.println("Elemento " + elemento.getId() + ": Não recebeu heartbeat do líder. Considerando o líder inativo!");
-                    break;
+                if (message.startsWith("UPDATE:")) {
+                    String[] parts = message.split(":");
+                    String documentId = parts[1];
+                    String version = parts[2];
+
+                    documents.put(documentId, version);
+                    Path filePath = elementDirectory.resolve(documentId + ".txt");
+                    Files.writeString(filePath, "Documento: " + documentId + "\nVersão: " + version);
+
+                    System.out.println("Elemento " + id + " atualizou documento: " + filePath);
                 }
             }
-
-            multicastSocket.leaveGroup(group);
-        } catch (Exception e) {
+        } catch (IOException e) {
             e.printStackTrace();
         }
-    }
-
-    private void processMessage(String message) {
-        if (message.equals("HEARTBEAT")) {
-            elemento.updateHeartbeat();
-            System.out.println("Elemento " + elemento.getId() + " recebeu heartbeat do líder.");
-        } else {
-            System.out.println("Elemento " + elemento.getId() + " recebeu mensagem: " + message);
-        }
-    }
-}
-
-// Classe principal para inicializar o Elemento
-public class Element {
-    public static void main(String[] args) {
-        if (args.length < 1) {
-            System.err.println("Por favor, informe um argumento para diferenciar os elementos (Ex: 1, 2, 3).");
-            System.exit(1);
-        }
-
-        int elementNumber = Integer.parseInt(args[0]); // Identificação do elemento
-        Elemento elemento = new Elemento(elementNumber);
-        MulticastReceiver receiver = new MulticastReceiver(elemento);
-
-        receiver.start();
     }
 }

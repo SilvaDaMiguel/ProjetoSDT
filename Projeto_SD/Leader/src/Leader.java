@@ -1,101 +1,174 @@
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
+import java.io.IOException;
+import java.net.*;
+import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
-// Classe que representa um Elemento
-class Elemento {
-    private int lider = 1; // Exemplo de variável de identificação do líder
-
-    public int getLider() {
-        return lider;
-    }
-
-    public void setLider(int lider) {
-        this.lider = lider;
-    }
-}
-
-// Classe que gerencia o grupo multicast
-class Multicast {
-    private static final String MULTICAST_GROUP = "224.0.0.1"; // Grupo multicast
+public class Leader {
+    private static final int CLIENT_PORT = 4446;
     private static final int MULTICAST_PORT = 4448;
-    private InetAddress group;
+    private static final String MULTICAST_GROUP = "224.0.0.1";
+    private static final int ELEMENT_REQUEST_PORT = 4447;
 
-    public Multicast() throws Exception {
-        group = InetAddress.getByName(MULTICAST_GROUP);
+    private final DocumentManager documentManager = new DocumentManager();
+    private volatile boolean isRunning = true;
+
+    public static void main(String[] args) {
+        new Leader().start();
     }
 
-    public InetAddress getGroup() {
-        return group;
+    public void start() {
+        System.out.println("Líder iniciado.");
+
+        try (DatagramSocket clientSocket = new DatagramSocket(CLIENT_PORT);
+             DatagramSocket elementRequestSocket = new DatagramSocket(ELEMENT_REQUEST_PORT);
+             DatagramSocket multicastSocket = new DatagramSocket()) {
+
+            // Threads para gerenciar funcionalidades
+            new Thread(() -> handleClientRequests(clientSocket, multicastSocket)).start();
+            new Thread(() -> handleElementRequests(elementRequestSocket)).start();
+            new Thread(this::sendHeartbeats).start();
+
+            // Simulação de execução por 60 segundos
+            Thread.sleep(60000);
+            isRunning = false;
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
-    public int getPort() {
-        return MULTICAST_PORT;
-    }
-
-    public void sendMulticastMessage(String message, DatagramSocket socket) throws Exception {
-        byte[] buffer = message.getBytes();
-        DatagramPacket packet = new DatagramPacket(buffer, buffer.length, group, MULTICAST_PORT);
-        socket.send(packet);
-    }
-}
-
-// Classe que representa o envio periódico de mensagens (ex.: HEARTBEAT)
-class SendTransmitter extends Thread {
-    private Multicast multicast;
-    private DatagramSocket socket;
-
-    public SendTransmitter(Multicast multicast, DatagramSocket socket) {
-        this.multicast = multicast;
-        this.socket = socket;
-    }
-
-    @Override
-    public void run() {
+    private void handleClientRequests(DatagramSocket clientSocket, DatagramSocket multicastSocket) {
         try {
-            while (true) {
-                String heartbeat = "HEARTBEAT";
-                multicast.sendMulticastMessage(heartbeat, socket);
-                System.out.println("Líder enviou heartbeat.");
-                Thread.sleep(5000); // A cada 5 segundos
+            byte[] buffer = new byte[1024];
+
+            while (isRunning) {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                clientSocket.receive(packet);
+
+                String message = new String(packet.getData(), 0, packet.getLength());
+                System.out.println("Líder recebeu mensagem: " + message);
+
+                if (message.contains(":")) {
+                    String[] parts = message.split(":");
+                    String documentId = parts[0];
+                    String version = parts[1];
+                    documentManager.addDocument(documentId + ":" + version);
+
+                    // Salva a nova versão no arquivo local
+                    Path filePath = Paths.get(documentId + ".txt");
+                    Files.writeString(filePath, version);
+
+                    System.out.println("Líder atualizou documento: " + documentId);
+
+                    // Envia atualizações via multicast
+                    List<String> updates = documentManager.createSendStructure();
+                    for (String update : updates) {
+                        sendMulticast(update, multicastSocket);
+                    }
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void handleElementRequests(DatagramSocket elementRequestSocket) {
+        try {
+            byte[] buffer = new byte[1024];
+
+            while (isRunning) {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                elementRequestSocket.receive(packet);
+
+                String request = new String(packet.getData(), 0, packet.getLength());
+                if (request.equals("REQUEST_DOCUMENTS")) {
+                    System.out.println("Líder recebeu solicitação de sincronização de um elemento.");
+
+                    InetAddress elementAddress = packet.getAddress();
+                    int elementPort = packet.getPort();
+
+                    // Envia a lista de documentos para o elemento
+                    List<String> documents = documentManager.getDocumentsClone();
+                    for (String doc : documents) {
+                        DatagramPacket responsePacket = new DatagramPacket(
+                                doc.getBytes(),
+                                doc.getBytes().length,
+                                elementAddress,
+                                elementPort
+                        );
+                        elementRequestSocket.send(responsePacket);
+                    }
+
+                    // Envia mensagem de término de sincronização
+                    DatagramPacket endPacket = new DatagramPacket(
+                            "END_SYNC".getBytes(),
+                            "END_SYNC".getBytes().length,
+                            elementAddress,
+                            elementPort
+                    );
+                    elementRequestSocket.send(endPacket);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void sendHeartbeats() {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            while (isRunning) {
+                sendMulticast("HEARTBEAT", socket);
+                Thread.sleep(5000);
             }
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
-}
 
-// Classe principal que atua como o Líder
-public class Leader {
-    private static final int CLIENT_PORT = 4446; // Porta do cliente
+    private void sendMulticast(String message, DatagramSocket socket) {
+        try {
+            InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
+            byte[] buffer = message.getBytes();
 
-    public static void main(String[] args) {
-        System.out.println("Líder iniciado. Enviando heartbeats para os elementos e retransmitindo mensagens do cliente...");
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, group, MULTICAST_PORT);
+            socket.send(packet);
 
-        try (DatagramSocket socket = new DatagramSocket();
-             DatagramSocket clientSocket = new DatagramSocket(CLIENT_PORT)) {
-
-            Multicast multicast = new Multicast();
-
-            // Inicia o envio periódico de heartbeats
-            SendTransmitter transmitter = new SendTransmitter(multicast, socket);
-            transmitter.start();
-
-            // Recebe mensagens do cliente e retransmite para os elementos
-            byte[] buffer = new byte[256];
-            while (true) {
-                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                clientSocket.receive(packet);
-
-                String clientMessage = new String(packet.getData(), 0, packet.getLength());
-                System.out.println("Líder recebeu mensagem do cliente: " + clientMessage);
-
-                // Retransmite a mensagem para os elementos
-                multicast.sendMulticastMessage(clientMessage, socket);
-                System.out.println("Líder retransmitiu mensagem: " + clientMessage);
-            }
-        } catch (Exception e) {
+            System.out.println("Líder enviou multicast: " + message);
+        } catch (IOException e) {
             e.printStackTrace();
+        }
+    }
+
+    /**
+     * Classe interna para gerenciar documentos de forma thread-safe.
+     */
+    private static class DocumentManager {
+        private final List<String> documents = Collections.synchronizedList(new ArrayList<>());
+
+        public synchronized void addDocument(String document) {
+            documents.add(document);
+            System.out.println("Documento adicionado: " + document);
+        }
+
+        public synchronized void removeDocument(String document) {
+            if (documents.remove(document)) {
+                System.out.println("Documento removido: " + document);
+            } else {
+                System.out.println("Documento não encontrado: " + document);
+            }
+        }
+
+        public synchronized List<String> getDocumentsClone() {
+            return new ArrayList<>(documents);
+        }
+
+        public synchronized List<String> createSendStructure() {
+            List<String> sendStructure = new ArrayList<>();
+            for (String doc : documents) {
+                sendStructure.add("UPDATE:" + doc);
+            }
+            return sendStructure;
         }
     }
 }
