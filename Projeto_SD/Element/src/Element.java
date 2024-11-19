@@ -76,13 +76,11 @@ public class Element {
                 String documentId = parts[1];
                 String version = parts[2];
 
-                if (!documents.containsKey(documentId)) { // Apenas sincroniza documentos ausentes
-                    documents.put(documentId, version);
-                    Path filePath = elementDirectory.resolve(documentId + ".txt");
-                    Files.writeString(filePath, "Documento: " + documentId + "\nVersão: " + version);
+                documents.put(documentId, version);
+                Path filePath = elementDirectory.resolve(documentId + ".txt");
+                Files.writeString(filePath, "Documento: " + documentId + "\nVersão: " + version);
 
-                    System.out.println("Elemento " + id + " sincronizou documento: " + documentId);
-                }
+                System.out.println("Elemento " + id + " sincronizou documento: " + documentId);
             }
 
             // Processar atualizações recebidas durante a sincronização
@@ -93,7 +91,6 @@ public class Element {
             isSyncing = false;
         }
     }
-
 
     private void processPendingUpdates() {
         pendingUpdates.forEach((documentId, version) -> {
@@ -166,7 +163,5 @@ public class Element {
             e.printStackTrace();
         }
     }
-
-
 
 }
