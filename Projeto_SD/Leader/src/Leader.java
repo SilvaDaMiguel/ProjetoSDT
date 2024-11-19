@@ -84,35 +84,50 @@ public class Leader {
     private void handleElementACKs(DatagramSocket ackSocket, DatagramSocket multicastSocket) {
         try {
             byte[] buffer = new byte[1024];
-
             while (isRunning) {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                ackSocket.receive(packet);
+                try {
+                    ackSocket.setSoTimeout(5000); // Timeout de 5 segundos
+                    ackSocket.receive(packet);
 
-                String message = new String(packet.getData(), 0, packet.getLength());
-                InetAddress elementAddress = packet.getAddress();
+                    String message = new String(packet.getData(), 0, packet.getLength());
+                    InetAddress elementAddress = packet.getAddress();
 
-                if (message.startsWith("ACK:")) {
-                    String documentId = message.split(":")[1];
-                    ackTracker.putIfAbsent(documentId, Collections.synchronizedList(new ArrayList<>()));
-                    List<InetAddress> ackList = ackTracker.get(documentId);
+                    if (message.startsWith("ACK:")) {
+                        String documentId = message.split(":")[1];
+                        ackTracker.putIfAbsent(documentId, Collections.synchronizedList(new ArrayList<>()));
+                        List<InetAddress> ackList = ackTracker.get(documentId);
 
-                    if (!ackList.contains(elementAddress)) {
-                        ackList.add(elementAddress);
-                        System.out.println("Líder recebeu ACK de " + elementAddress + " para documento: " + documentId);
+                        if (!ackList.contains(elementAddress)) {
+                            ackList.add(elementAddress);
+                            System.out.println("Líder recebeu ACK de " + elementAddress + " para documento: " + documentId);
 
-                        // Verificar se a maioria foi atingida
-                        if (ackList.size() >= getMajority()) {
-                            System.out.println("Maioria atingida para documento: " + documentId);
-                            sendCommit(documentId, multicastSocket);
+                            // Verificar se a maioria foi atingida
+                            if (ackList.size() >= getMajority()) {
+                                System.out.println("Maioria atingida para documento: " + documentId);
+                                sendCommit(documentId, multicastSocket);
+                            }
                         }
                     }
+                } catch (SocketTimeoutException e) {
+                    System.out.println("Timeout ao esperar ACK para documento. Reenviando atualizações pendentes...");
+                    resendPendingUpdates(multicastSocket);
                 }
             }
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
+
+    // Reenvia atualizações pendentes para elementos
+    private void resendPendingUpdates(DatagramSocket multicastSocket) {
+        List<String> updates = documentManager.createSendStructure();
+        for (String update : updates) {
+            sendMulticast(update, multicastSocket);
+        }
+        System.out.println("Atualizações pendentes reenviadas.");
+    }
+
 
     // Retorna o número necessário para atingir a maioria
     private int getMajority() {
@@ -180,17 +195,20 @@ public class Leader {
         }
     }
 
-    // Envia heartbeats regularmente para simular o líder ativo
+
     private void sendHeartbeats() {
-        while (isRunning) {
-            try {
-                Thread.sleep(5000);
-                System.out.println("Líder enviando heartbeat...");
-            } catch (InterruptedException e) {
-                e.printStackTrace();
+        try (DatagramSocket socket = new DatagramSocket()) {
+            while (isRunning) {
+                Thread.sleep(5000); // Intervalo de 5 segundos
+                String heartbeatMessage = "HEARTBEAT";
+                sendMulticast(heartbeatMessage, socket);
+                System.out.println("Líder enviou heartbeat.");
             }
+        } catch (IOException | InterruptedException e) {
+            e.printStackTrace();
         }
     }
+
 
 
 // Classe para gestão de documentos
