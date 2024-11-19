@@ -8,6 +8,7 @@ public class Element {
     private static final String MULTICAST_GROUP = "224.0.0.1";
     private static final int MULTICAST_PORT = 4448;
     private static final int ELEMENT_REQUEST_PORT = 4447;
+    private static final int ELEMENT_ACK_PORT = 4450;
 
     private final int id;
     private final Path elementDirectory;
@@ -43,11 +44,14 @@ public class Element {
         syncWithLeader();
     }
 
+    private final ConcurrentMap<String, String> pendingUpdates = new ConcurrentHashMap<>();
+    private volatile boolean isSyncing = true;
+
     private void syncWithLeader() {
         try (DatagramSocket socket = new DatagramSocket()) {
             InetAddress leaderAddress = InetAddress.getByName("127.0.0.1");
 
-            // Solicita a lista de documentos ao líder
+            // Solicitar lista de documentos ao líder
             String request = "REQUEST_DOCUMENTS";
             DatagramPacket requestPacket = new DatagramPacket(
                     request.getBytes(),
@@ -57,7 +61,6 @@ public class Element {
             );
             socket.send(requestPacket);
 
-            // Recebe a lista de documentos
             byte[] buffer = new byte[1024];
             while (true) {
                 DatagramPacket responsePacket = new DatagramPacket(buffer, buffer.length);
@@ -65,13 +68,13 @@ public class Element {
 
                 String message = new String(responsePacket.getData(), 0, responsePacket.getLength());
                 if (message.equals("END_SYNC")) {
-                    System.out.println("Sincronização com o líder concluída.");
+                    System.out.println("Sincronização inicial concluída.");
                     break;
                 }
 
                 String[] parts = message.split(":");
-                String documentId = parts[0];
-                String version = parts[1];
+                String documentId = parts[1];
+                String version = parts[2];
 
                 documents.put(documentId, version);
                 Path filePath = elementDirectory.resolve(documentId + ".txt");
@@ -79,10 +82,31 @@ public class Element {
 
                 System.out.println("Elemento " + id + " sincronizou documento: " + documentId);
             }
+
+            // Processar atualizações recebidas durante a sincronização
+            processPendingUpdates();
         } catch (IOException e) {
             e.printStackTrace();
+        } finally {
+            isSyncing = false;
         }
     }
+
+    private void processPendingUpdates() {
+        pendingUpdates.forEach((documentId, version) -> {
+            try {
+                documents.put(documentId, version);
+                Path filePath = elementDirectory.resolve(documentId + ".txt");
+                Files.writeString(filePath, "Documento: " + documentId + "\nVersão: " + version);
+
+                System.out.println("Elemento " + id + " aplicou atualização pendente: " + documentId);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        });
+        pendingUpdates.clear();
+    }
+
 
     private void listenToMulticast() {
         try (MulticastSocket multicastSocket = new MulticastSocket(MULTICAST_PORT)) {
@@ -103,15 +127,41 @@ public class Element {
                     String documentId = parts[1];
                     String version = parts[2];
 
-                    documents.put(documentId, version);
-                    Path filePath = elementDirectory.resolve(documentId + ".txt");
-                    Files.writeString(filePath, "Documento: " + documentId + "\nVersão: " + version);
+                    if (isSyncing) {
+                        pendingUpdates.put(documentId, version);
+                    } else {
+                        documents.put(documentId, version);
+                        Path filePath = elementDirectory.resolve(documentId + ".txt");
+                        Files.writeString(filePath, "Documento: " + documentId + "\nVersão: " + version);
 
-                    System.out.println("Elemento " + id + " atualizou documento: " + filePath);
+                        System.out.println("Elemento " + id + " atualizou documento: " + filePath);
+                    }
+
+                    // Enviar ACK para o líder
+                    sendAckToLeader(documentId);
+                } else if (message.startsWith("COMMIT:")) {
+                    String documentId = message.split(":")[1];
+                    System.out.println("Elemento " + id + " recebeu COMMIT para o documento: " + documentId);
                 }
             }
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
+    private void sendAckToLeader(String documentId) {
+        try (DatagramSocket ackSocket = new DatagramSocket()) {
+            String ackMessage = "ACK:" + documentId;
+            DatagramPacket ackPacket = new DatagramPacket(
+                    ackMessage.getBytes(),
+                    ackMessage.length(),
+                    InetAddress.getByName("127.0.0.1"), // Endereço do líder
+                    ELEMENT_ACK_PORT // Porta para ACKs
+            );
+            ackSocket.send(ackPacket);
+            System.out.println("Elemento " + id + " enviou ACK para o líder sobre documento: " + documentId);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
 }
