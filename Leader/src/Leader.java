@@ -1,77 +1,98 @@
 import java.io.IOException;
 import java.net.*;
 import java.nio.file.*;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.*;
+import java.util.*;
 
 public class Leader {
-    private static final int CLIENT_PORT = 4446;
-    private static final int MULTICAST_PORT = 4448;
     private static final String MULTICAST_GROUP = "224.0.0.1";
-    private static final int ELEMENT_REQUEST_PORT = 4447;
-    private static final int ELEMENT_ACK_PORT = 4450;
+    private static final int MULTICAST_PORT = 5000;
+    private static final int CLIENT_PORT = 4446;
+    private static final int HEARTBEAT_INTERVAL = 3000; // 3 segundos
+    private static final int TIMEOUT = 10000; // 10 segundos para considerar um elemento inativo
 
-    private final DocumentManager documentManager = new DocumentManager();
-    private final ConcurrentMap<String, List<InetAddress>> ackTracker = new ConcurrentHashMap<>();
-    private volatile boolean isRunning = true;
+    private final String id; // ID único do líder
+    private final ConcurrentMap<String, Long> activeElements = new ConcurrentHashMap<>();
+    private final DocumentManager documentManager = new DocumentManager(); // Gerenciador de documentos
+    private final Path directoryPath;
+
+    // Rastrear ACKs recebidos
+    private final ConcurrentMap<String, Set<String>> ackTracker = new ConcurrentHashMap<>();
+
+    public Leader() {
+        this.id = UUID.randomUUID().toString(); // Geração do ID único
+        directoryPath = Paths.get(System.getProperty("user.dir"), "leader_files");
+        try {
+            if (Files.notExists(directoryPath)) {
+                Files.createDirectories(directoryPath);
+                System.out.println("Diretório do líder criado: " + directoryPath.toAbsolutePath());
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
 
     public static void main(String[] args) {
         new Leader().start();
     }
 
     public void start() {
-        System.out.println("Líder iniciado.");
+        new Thread(this::sendHeartbeats).start();
+        new Thread(this::listenToMulticast).start();
+        new Thread(this::checkActiveElements).start();
+        new Thread(this::listenToClients).start();
+    }
 
-        try (DatagramSocket clientSocket = new DatagramSocket(CLIENT_PORT);
-             DatagramSocket elementRequestSocket = new DatagramSocket(ELEMENT_REQUEST_PORT);
-             DatagramSocket ackSocket = new DatagramSocket(ELEMENT_ACK_PORT);
-             DatagramSocket multicastSocket = new DatagramSocket()) {
+    private void sendHeartbeats() {
+        try (MulticastSocket multicastSocket = new MulticastSocket()) {
+            InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
+            String message = "LEADER:" + id;
 
-            new Thread(() -> handleClientRequests(clientSocket, multicastSocket)).start();
-            new Thread(() -> handleElementRequests(elementRequestSocket)).start();
-            new Thread(() -> handleElementACKs(ackSocket, multicastSocket)).start();
-            new Thread(this::sendHeartbeats).start();
+            while (true) {
+                byte[] buffer = message.getBytes();
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length, group, MULTICAST_PORT);
+                multicastSocket.send(packet);
 
-            Thread.sleep(60000); // Manter o líder ativo durante 60s
-            isRunning = false;
-        } catch (Exception e) {
+                System.out.println("Líder enviou heartbeat.");
+                Thread.sleep(HEARTBEAT_INTERVAL);
+            }
+        } catch (IOException | InterruptedException e) {
             e.printStackTrace();
         }
     }
 
+    private void listenToMulticast() {
+        try (MulticastSocket multicastSocket = new MulticastSocket(MULTICAST_PORT)) {
+            InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
+            multicastSocket.joinGroup(group);
 
-    // Lidar com pedidos do cliente
-    private void handleClientRequests(DatagramSocket clientSocket, DatagramSocket multicastSocket) {
-        try {
             byte[] buffer = new byte[1024];
 
-            while (isRunning) {
+            while (true) {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                clientSocket.receive(packet);
+                multicastSocket.receive(packet);
 
                 String message = new String(packet.getData(), 0, packet.getLength());
                 System.out.println("Líder recebeu mensagem: " + message);
 
-                if (message.contains(":")) {
+                // Ignorar mensagens enviadas pelo próprio líder
+                if (message.startsWith("UPDATE:") || message.startsWith("LEADER:")) {
+                    String senderId = message.split(":")[1];
+                    if (senderId.equals(this.id)) {
+                        continue; // Ignorar mensagens do próprio líder
+                    }
+                }
+
+                if (message.startsWith("ACTIVE:")) {
+                    String id = message.split(":")[1];
+                    activeElements.put(id, System.currentTimeMillis());
+                    System.out.println("Líder recebeu resposta de elemento: " + id);
+                } else if (message.startsWith("ACK:")) {
                     String[] parts = message.split(":");
-                    String documentId = parts[0];
-                    String version = parts[1];
-
-                    // Atualizar o documento no gestor de documentos
-                    documentManager.addDocument(documentId + ":" + version);
-
-                    Path filePath = Paths.get(documentId + ".txt");
-                    Files.writeString(filePath, version);
-
-                    System.out.println("Líder atualizou documento: " + documentId);
-
-                    // Enviar atualizações por multicast
-                    List<String> updates = documentManager.createSendStructure();
-                    for (String update : updates) {
-                        sendMulticast(update, multicastSocket);
+                    if (parts.length == 3) {
+                        String elementId = parts[1];
+                        String documentName = parts[2];
+                        receiveAck(elementId, documentName);
                     }
                 }
             }
@@ -80,146 +101,179 @@ public class Leader {
         }
     }
 
-    // Lidar com ACKs dos elementos
-    private void handleElementACKs(DatagramSocket ackSocket, DatagramSocket multicastSocket) {
-        try {
-            byte[] buffer = new byte[1024];
 
-            while (isRunning) {
-                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                ackSocket.receive(packet);
+    private void checkActiveElements() {
+        while (true) {
+            long currentTime = System.currentTimeMillis();
+            activeElements.entrySet().removeIf(entry -> currentTime - entry.getValue() > TIMEOUT);
 
-                String message = new String(packet.getData(), 0, packet.getLength());
-                InetAddress elementAddress = packet.getAddress();
-
-                if (message.startsWith("ACK:")) {
-                    String documentId = message.split(":")[1];
-                    ackTracker.putIfAbsent(documentId, Collections.synchronizedList(new ArrayList<>()));
-                    List<InetAddress> ackList = ackTracker.get(documentId);
-
-                    if (!ackList.contains(elementAddress)) {
-                        ackList.add(elementAddress);
-                        System.out.println("Líder recebeu ACK de " + elementAddress + " para documento: " + documentId);
-
-                        // Verificar se a maioria foi atingida
-                        if (ackList.size() >= getMajority()) {
-                            System.out.println("Maioria atingida para documento: " + documentId);
-                            sendCommit(documentId, multicastSocket);
-                        }
-                    }
-                }
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    // Retorna o número necessário para atingir a maioria
-    private int getMajority() {
-        // Simulação de maioria para teste
-        return 2; // Ajustar consoante o número de elementos esperado
-    }
-
-    // Envia uma mensagem de COMMIT aos elementos
-    private void sendCommit(String documentId, DatagramSocket multicastSocket) {
-        String commitMessage = "COMMIT:" + documentId;
-        sendMulticast(commitMessage, multicastSocket);
-        System.out.println("Líder enviou COMMIT para documento: " + documentId);
-    }
-
-    // Envia uma mensagem multicast para todos os elementos
-    private void sendMulticast(String message, DatagramSocket socket) {
-        try {
-            InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
-            byte[] buffer = message.getBytes();
-            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, group, MULTICAST_PORT);
-            socket.send(packet);
-            System.out.println("Mensagem multicast enviada: " + message);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    // Lidar com pedidos de sincronização dos elementos
-    private void handleElementRequests(DatagramSocket socket) {
-        try {
-            byte[] buffer = new byte[1024];
-
-            while (isRunning) {
-                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                socket.receive(packet);
-
-                String message = new String(packet.getData(), 0, packet.getLength());
-                if (message.equals("REQUEST_DOCUMENTS")) {
-                    InetAddress address = packet.getAddress();
-                    int port = packet.getPort();
-
-                    System.out.println("Líder recebeu pedido de sincronização de " + address);
-
-                    // Enviar a lista de documentos confirmados
-                    List<String> documents = documentManager.createSendStructure();
-                    for (String doc : documents) {
-                        DatagramPacket responsePacket = new DatagramPacket(
-                                doc.getBytes(), doc.length(), address, port
-                        );
-                        socket.send(responsePacket);
-                    }
-
-                    // Indicar o final da sincronização
-                    String endMessage = "END_SYNC";
-                    DatagramPacket endPacket = new DatagramPacket(
-                            endMessage.getBytes(), endMessage.length(), address, port
-                    );
-                    socket.send(endPacket);
-
-                    System.out.println("Líder completou envio de sincronização para " + address);
-                }
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    // Envia heartbeats regularmente para simular o líder ativo
-    private void sendHeartbeats() {
-        while (isRunning) {
+            System.out.println("Elementos ativos: " + activeElements.keySet());
             try {
-                Thread.sleep(5000);
-                System.out.println("Líder enviando heartbeat...");
+                Thread.sleep(HEARTBEAT_INTERVAL);
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
         }
     }
 
+    private void listenToClients() {
+        try (DatagramSocket clientSocket = new DatagramSocket(CLIENT_PORT)) {
+            System.out.println("Líder aguardando mensagens dos clientes...");
 
-// Classe para gestão de documentos
-private static class DocumentManager {
-    private final List<String> documents = Collections.synchronizedList(new ArrayList<>());
+            byte[] buffer = new byte[1024];
 
-    public synchronized void addDocument(String document) {
-        documents.add(document);
-        System.out.println("Documento adicionado: " + document);
+            while (true) {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                clientSocket.receive(packet);
+
+                String message = new String(packet.getData(), 0, packet.getLength());
+                System.out.println("Líder recebeu: " + message);
+
+                processClientMessage(message);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
 
-    public synchronized void removeDocument(String document) {
-        if (documents.remove(document)) {
-            System.out.println("Documento removido: " + document);
+    private void processClientMessage(String message) {
+        String[] parts = message.split(":", 3);
+        if (parts.length < 3) {
+            System.err.println("Mensagem inválida recebida: " + message);
+            return;
+        }
+
+        String action = parts[0];
+        String fileName = parts[1];
+        String content = parts[2];
+
+        if ("CREATE".equals(action) || "UPDATE".equals(action)) {
+            documentManager.addDocumentVersion(fileName, content);
+            saveToFile(fileName, content);
+            System.out.println("Documento " + fileName + " salvo no líder.");
+
+            // Envia atualização para os elementos
+            sendUpdate(fileName, content);
+            ackTracker.put(fileName, ConcurrentHashMap.newKeySet());
         } else {
-            System.out.println("Documento não encontrado: " + document);
+            System.err.println("Ação desconhecida: " + action);
         }
     }
 
-    public synchronized List<String> getDocumentsClone() {
-        return new ArrayList<>(documents);
+    private void sendUpdate(String fileName, String content) {
+        try (MulticastSocket multicastSocket = new MulticastSocket()) {
+            InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
+
+            // Envia a atualização atual
+            String message = "UPDATE:" + fileName + ":" + content;
+            byte[] buffer = message.getBytes();
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, group, MULTICAST_PORT);
+            multicastSocket.send(packet);
+
+            // Envia o histórico do documento
+            String historyMessage = createHistoryMessage(fileName);
+            if (historyMessage != null) {
+                buffer = historyMessage.getBytes();
+                packet = new DatagramPacket(buffer, buffer.length, group, MULTICAST_PORT);
+                multicastSocket.send(packet);
+            }
+
+            System.out.println("Líder enviou atualização e histórico para: " + fileName);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
 
-    public synchronized List<String> createSendStructure() {
-        List<String> sendStructure = new ArrayList<>();
-        for (String doc : documents) {
-            sendStructure.add("UPDATE:" + doc);
+
+    private String createHistoryMessage(String fileName) {
+        try {
+            List<String> historyFiles = Files.walk(documentManager.historyDirectory)
+                    .filter(path -> path.getFileName().toString().startsWith(fileName + "_v"))
+                    .map(path -> path.getFileName().toString())
+                    .sorted()
+                    .toList();
+
+            StringBuilder historyBuilder = new StringBuilder("HISTORY:").append(fileName).append(":");
+            for (String history : historyFiles) {
+                Path filePath = documentManager.historyDirectory.resolve(history);
+                String content = Files.readString(filePath);
+                historyBuilder.append(history).append("|").append(content).append(";");
+            }
+
+            return historyBuilder.toString();
+        } catch (IOException e) {
+            System.err.println("Erro ao criar mensagem de histórico para: " + fileName);
+            e.printStackTrace();
+            return null;
         }
-        return sendStructure;
     }
-}
+
+
+    private void receiveAck(String elementId, String documentName) {
+        ackTracker.computeIfPresent(documentName, (doc, acks) -> {
+            acks.add(elementId);
+            if (acks.size() > activeElements.size() / 2) { // Maioria confirmada
+                commitDocument(documentName);
+            }
+            return acks;
+        });
+    }
+
+
+    private void commitDocument(String fileName) {
+        try (MulticastSocket multicastSocket = new MulticastSocket()) {
+            InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
+            String commitMessage = "COMMIT:" + fileName;
+            byte[] buffer = commitMessage.getBytes();
+
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length, group, MULTICAST_PORT);
+            multicastSocket.send(packet);
+
+            System.out.println("Líder enviou commit: " + fileName);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+
+    private void saveToFile(String fileName, String content) {
+        Path filePath = directoryPath.resolve(fileName);
+        try {
+            Files.writeString(filePath, content);
+            System.out.println("Documento salvo fisicamente: " + filePath.toAbsolutePath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Classe para gestão de documentos com histórico
+    private static class DocumentManager {
+        private final ConcurrentMap<String, Integer> documentVersionMap = new ConcurrentHashMap<>();
+        private final Path historyDirectory = Paths.get(System.getProperty("user.dir"), "leader_files", "history");
+
+        public DocumentManager() {
+            try {
+                if (Files.notExists(historyDirectory)) {
+                    Files.createDirectories(historyDirectory);
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        public synchronized void addDocumentVersion(String document, String content) {
+            int version = documentVersionMap.getOrDefault(document, 0) + 1;
+            documentVersionMap.put(document, version);
+
+            Path versionFile = historyDirectory.resolve(document + "_v" + version + ".txt");
+            try {
+                Files.writeString(versionFile, content);
+                System.out.println("Versão " + version + " do documento " + document + " salva.");
+            } catch (IOException e) {
+                System.err.println("Erro ao salvar a versão " + version + " do documento " + document);
+                e.printStackTrace();
+            }
+        }
+
+    }
 }
